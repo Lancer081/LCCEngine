@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 
 #define U64 unsigned long long
 
@@ -38,17 +39,6 @@ typedef struct {
 	int count;
 } move_list;
 
-char promoted_pieces[] = {
-	[Q] = 'q',
-	[R] = 'r',
-	[B] = 'b',
-	[N] = 'n',
-	[q] = 'q',
-	[r] = 'r',
-	[b] = 'b',
-	[n] = 'n'
-};
-
 const char* square_to_coords[] = {
 	"a8", "b8", "c8", "d8", "e8", "f8", "g8", "h8",
 	"a7", "b7", "c7", "d7", "e7", "f7", "g7", "h7",
@@ -77,10 +67,33 @@ int char_pieces[] = {
 	['k'] = k
 };
 
+char promoted_pieces[] = {
+	[Q] = 'q',
+	[R] = 'r',
+	[B] = 'b',
+	[N] = 'n',
+	[q] = 'q',
+	[r] = 'r',
+	[b] = 'b',
+	[n] = 'n'
+};
+
 const U64 not_A_file = 18374403900871474942ULL;
 const U64 not_H_file = 9187201950435737471ULL;
 const U64 not_HG_file = 4557430888798830399ULL;
 const U64 not_AB_file = 18229723555195321596ULL;
+
+// castling rights update constants
+const int castling_rights[64] = {
+     7, 15, 15, 15,  3, 15, 15, 11,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 15,
+    13, 15, 15, 15, 12, 15, 15, 14
+};
 
 // bishop relevant occupancy bit count for every square on board
 const int bishop_relevant_bits[64] = {
@@ -582,7 +595,7 @@ void parse_fen(char* fen)
 	// go to enpassant square
 	fen++;
 
-	if (*fen == '-')
+	if (*fen != '-')
 	{
 		int file = fen[0] - 'a';
 		int rank = 8 - (fen[1] - '0');
@@ -802,10 +815,10 @@ static inline int make_move(int move, int move_flag)
 			// loop over bitboards opposite to the current side
 			for (int p = start_piece; p <= end_piece; p++)
 			{
-				if (get_bit(board[piece], to_square))
+				if (get_bit(board[p], to_square))
 				{
 					// removes captured piece
-					pop_bit(board[piece], to_square);
+					pop_bit(board[p], to_square);
 					break;
 				}
 			}
@@ -847,6 +860,32 @@ static inline int make_move(int move, int move_flag)
 				break;
 			}
 		}
+		
+		// update castling rights
+		castle &= castling_rights[from_square];
+		castle &= castling_rights[to_square];
+		
+		// zero out occupancy
+		memset(occupancy, 0ULL, 24);
+		
+		// reset occupancy
+		for (int bb_piece = P; bb_piece <= K; bb_piece++)
+			occupancy[white] |= board[bb_piece];
+		for (int bb_piece = p; bb_piece <= k; bb_piece++)
+			occupancy[black] |= board[bb_piece];
+			
+		occupancy[both] |= occupancy[white];
+		occupancy[both] |= occupancy[black];
+		
+		side ^= 1;
+		
+		if (is_square_attacked((side == white) ? get_lsb(board[k]) : get_lsb(board[K]), side))
+		{
+			take_back();
+			return 0;
+		}
+		else
+			return 1;
 	}
 	else
 	{
@@ -855,6 +894,7 @@ static inline int make_move(int move, int move_flag)
 		else
 			return 0;
 	}
+	
 }
 
 static inline void generate_moves(move_list* moves)
@@ -907,7 +947,7 @@ static inline void generate_moves(move_list* moves)
 					{
 						to_square = get_lsb(attacks);
 
-						if (from_square >= a7 && to_square <= h7)
+						if (from_square >= a7 && from_square <= h7)
 						{
 							add_move(moves, encode_move(from_square, to_square, piece, Q, 1, 0, 0, 0));
 							add_move(moves, encode_move(from_square, to_square, piece, R, 1, 0, 0, 0));
@@ -942,7 +982,7 @@ static inline void generate_moves(move_list* moves)
 					if (!get_bit(occupancy[both], f1) && !get_bit(occupancy[both], g1))
 					{
 						if (!is_square_attacked(e1, black) && !is_square_attacked(f1, black))
-							add_move(moves, encode_move(from_square, to_square, piece, 0, 0, 0, 0, 1));
+							add_move(moves, encode_move(e1, g1, piece, 0, 0, 0, 0, 1));
 					}
 				}
 				else if (castle & wq)
@@ -950,7 +990,7 @@ static inline void generate_moves(move_list* moves)
 					if (!get_bit(occupancy[both], d1) && !get_bit(occupancy[both], c1) && !get_bit(occupancy[both], b1))
 					{
 						if (!is_square_attacked(e1, black) && !is_square_attacked(d1, black))
-							add_move(moves, encode_move(from_square, to_square, piece, 0, 0, 0, 0, 1));
+							add_move(moves, encode_move(e1, c1, piece, 0, 0, 0, 0, 1));
 					}
 				}
 			}
@@ -993,7 +1033,7 @@ static inline void generate_moves(move_list* moves)
 					{
 						to_square = get_lsb(attacks);
 
-						if (from_square >= a2 && to_square <= h2)
+						if (from_square >= a2 && from_square <= h2)
 						{
 							add_move(moves, encode_move(from_square, to_square, piece, q, 1, 0, 0, 0));
 							add_move(moves, encode_move(from_square, to_square, piece, r, 1, 0, 0, 0));
@@ -1028,7 +1068,7 @@ static inline void generate_moves(move_list* moves)
 					if (!get_bit(occupancy[both], f8) && !get_bit(occupancy[both], g8))
 					{
 						if (!is_square_attacked(e8, black) && !is_square_attacked(f8, black))
-							add_move(moves, encode_move(from_square, to_square, piece, 0, 0, 0, 0, 1));
+							add_move(moves, encode_move(e8, g8, piece, 0, 0, 0, 0, 1));
 					}
 				}
 				else if (castle & bq)
@@ -1037,7 +1077,7 @@ static inline void generate_moves(move_list* moves)
 					{
 						if (!is_square_attacked(e8, black) && !is_square_attacked(d8, black))
 						{
-							add_move(moves, encode_move(from_square, to_square, piece, 0, 0, 0, 0, 1));
+							add_move(moves, encode_move(e8, c8, piece, 0, 0, 0, 0, 1));
 						}
 					}
 				}
@@ -1049,7 +1089,7 @@ static inline void generate_moves(move_list* moves)
 		{
 			while (bitboard)
 			{
-				to_square = get_lsb(bitboard);
+				from_square = get_lsb(bitboard);
 
 				attacks = knight_attacks[from_square] & ((side == white) ? ~occupancy[white] : ~occupancy[black]);
 
@@ -1076,7 +1116,7 @@ static inline void generate_moves(move_list* moves)
 		{
 			while (bitboard)
 			{
-				to_square = get_lsb(bitboard);
+				from_square = get_lsb(bitboard);
 
 				attacks = get_bishop_attacks(from_square, occupancy[both]) & ((side == white) ? ~occupancy[white] : ~occupancy[black]);
 
@@ -1130,7 +1170,7 @@ static inline void generate_moves(move_list* moves)
 		{
 			while (bitboard)
 			{
-				to_square = get_lsb(bitboard);
+				from_square = get_lsb(bitboard);
 
 				attacks = get_queen_attacks(from_square, occupancy[both]) & ((side == white) ? ~occupancy[white] : ~occupancy[black]);
 
@@ -1157,7 +1197,7 @@ static inline void generate_moves(move_list* moves)
 		{
 			while (bitboard)
 			{
-				to_square = get_lsb(bitboard);
+				from_square = get_lsb(bitboard);
 
 				attacks = king_attacks[from_square] & ((side == white) ? ~occupancy[white] : ~occupancy[black]);
 
@@ -1181,6 +1221,35 @@ static inline void generate_moves(move_list* moves)
 	}
 }
 
+long nodes;
+
+static inline void perft(int depth)
+{
+	if (depth == 0)
+	{
+		nodes++;
+		return;
+	}
+	
+	move_list moves[1];
+	
+	generate_moves(moves);
+	
+	for (int i = 0; i < moves->count; i++)
+	{
+		int move = moves->moves[i];
+		
+		copy_board();
+		
+		if(!make_move(move, all_moves))
+			continue;
+		
+		perft(depth - 1);
+		
+		take_back();
+	}
+}
+
 unsigned int state = 1804289383;
 
 unsigned int get_random_number()
@@ -1194,6 +1263,13 @@ unsigned int get_random_number()
 	return num;
 }
 
+int get_time_ms()
+{
+	struct timeval time_value;
+	gettimeofday(&time_value, NULL);
+	return time_value.tv_sec * 1000 + time_value.tv_usec / 1000;
+}
+
 void init_all()
 {
 	init_leaper_attacks();
@@ -1205,27 +1281,17 @@ int main()
 {
 	init_all();
 
-	parse_fen(tricky_position);
+	parse_fen(start_position);
 	print_board();
 
-	move_list moves[1];
-
-	generate_moves(moves);
-
-	for (int i = 0; i < moves->count; i++)
-	{
-		int move = moves->moves[i];
-
-		copy_board();
-
-		make_move(move, all_moves);
-		print_board();
-		getchar();
-
-		take_back();
-		print_board();
-		getchar();
-	}
+	int start = get_time_ms();
+	
+	perft(4);
+	
+	int end = get_time_ms();
+	
+	printf("Run time: %d ms\n", end-start);
+	printf("Nodes: %ld\n", nodes);
 
 	return 0;
 }
