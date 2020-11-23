@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 
@@ -12,6 +13,49 @@
 #define tricky_position "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1 "
 #define killer_position "rnbqkb1r/pp1p1pPp/8/2p1pP2/1P1P4/3P3P/P1P1P3/RNBQKBNR w KQkq e6 0 1"
 #define cmk_position "r2q1rk1/ppp2ppp/2n1bn2/2b1p3/3pP3/3P1NPP/PPP1NPB1/R1BQ1RK1 b - - 0 9 "
+
+#define hash_size 0x400000
+#define no_hash_entry 100000
+
+#define hash_flag_exact 0
+#define hash_flag_alpha 1
+#define hash_flag_beta 2
+
+// encode move
+#define encode_move(source, target, piece, promoted, capture, double, enpassant, castling) \
+    (source) |          \
+    (target << 6) |     \
+    (piece << 12) |     \
+    (promoted << 16) |  \
+    (capture << 20) |   \
+    (double << 21) |    \
+    (enpassant << 22) | \
+    (castling << 23)    \
+
+#define get_move_source(move) (move & 0x3f)
+#define get_move_target(move) ((move & 0xfc0) >> 6)
+#define get_move_piece(move) ((move & 0xf000) >> 12)
+#define get_move_promoted(move) ((move & 0xf0000) >> 16)
+#define get_move_capture(move) (move & 0x100000)
+#define get_move_double(move) (move & 0x200000)
+#define get_move_enpassant(move) (move & 0x400000)
+#define get_move_castling(move) (move & 0x800000)
+
+// preserve board state
+#define copy_board()                                                      \
+    U64 board_copy[12], occupancy_copy[3];								  \
+    int side_copy, enpassant_copy, castle_copy;                           \
+    memcpy(board_copy, board, 96);										  \
+    memcpy(occupancy_copy, occupancy, 24);                                \
+    side_copy = side, enpassant_copy = enpassant, castle_copy = castle;   \
+    U64 hash_key_copy = hash_key;									      \
+
+// restore board state
+#define take_back()                                                       \
+    memcpy(board, board_copy, 96);										  \
+    memcpy(occupancy, occupancy_copy, 24);                                \
+    side = side_copy, enpassant = enpassant_copy, castle = castle_copy;   \
+    hash_key = hash_key_copy											  \
 
 enum {
 	a8, b8, c8, d8, e8, f8, g8, h8,
@@ -38,6 +82,17 @@ typedef struct {
 	int moves[256];
 	int count;
 } move_list;
+
+typedef struct {
+	U64 hash_key;
+	int depth;
+	int flag;
+	int score;
+} tt;
+
+tt transpos_table[hash_size];
+
+const int INF = 50000;
 
 const char* square_to_coords[] = {
 	"a8", "b8", "c8", "d8", "e8", "f8", "g8", "h8",
@@ -76,6 +131,119 @@ char promoted_pieces[] = {
 	[r] = 'r',
 	[b] = 'b',
 	[n] = 'n'
+};
+
+int material_score[12] = {
+	100,
+	300,
+	350,
+	500,
+	1000,
+	10000,
+	-100,
+	-300,
+	-350,
+	-500,
+	-1000,
+	-10000
+};
+
+
+// pawn positional score
+const int pawn_score[64] = 
+{
+    90,  90,  90,  90,  90,  90,  90,  90,
+    30,  30,  30,  40,  40,  30,  30,  30,
+    20,  20,  20,  30,  30,  30,  20,  20,
+    10,  10,  10,  20,  20,  10,  10,  10,
+     5,   5,  10,  20,  20,   5,   5,   5,
+     0,   0,   0,   5,   5,   0,   0,   0,
+     0,   0,   0, -10, -10,   0,   0,   0,
+     0,   0,   0,   0,   0,   0,   0,   0
+};
+
+// knight positional score
+const int knight_score[64] = 
+{
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+    -5,   0,   0,  10,  10,   0,   0,  -5,
+    -5,   5,  20,  20,  20,  20,   5,  -5,
+    -5,  10,  20,  30,  30,  20,  10,  -5,
+    -5,  10,  20,  30,  30,  20,  10,  -5,
+    -5,   5,  20,  10,  10,  20,   5,  -5,
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+    -5, -10,   0,   0,   0,   0, -10,  -5
+};
+
+// bishop positional score
+const int bishop_score[64] = 
+{
+     0,   0,   0,   0,   0,   0,   0,   0,
+     0,   0,   0,   0,   0,   0,   0,   0,
+     0,   0,   0,  10,  10,   0,   0,   0,
+     0,   0,  10,  20,  20,  10,   0,   0,
+     0,   0,  10,  20,  20,  10,   0,   0,
+     0,  10,   0,   0,   0,   0,  10,   0,
+     0,  30,   0,   0,   0,   0,  30,   0,
+     0,   0, -10,   0,   0, -10,   0,   0
+
+};
+
+// rook positional score
+const int rook_score[64] =
+{
+    50,  50,  50,  50,  50,  50,  50,  50,
+    50,  50,  50,  50,  50,  50,  50,  50,
+     0,   0,  10,  20,  20,  10,   0,   0,
+     0,   0,  10,  20,  20,  10,   0,   0,
+     0,   0,  10,  20,  20,  10,   0,   0,
+     0,   0,  10,  20,  20,  10,   0,   0,
+     0,   0,  10,  20,  20,  10,   0,   0,
+     0,   0,   0,  20,  20,   0,   0,   0
+
+};
+
+// king positional score
+const int king_score[64] = 
+{
+     0,   0,   0,   0,   0,   0,   0,   0,
+     0,   0,   5,   5,   5,   5,   0,   0,
+     0,   5,   5,  10,  10,   5,   5,   0,
+     0,   5,  10,  20,  20,  10,   5,   0,
+     0,   5,  10,  20,  20,  10,   5,   0,
+     0,   0,   5,  10,  10,   5,   0,   0,
+     0,   5,   5,  -5,  -5,   0,   5,   0,
+     0,   0,   5,   0, -15,   0,  10,   0
+};
+
+// mirror positional score tables for opposite side
+const int mirror_score[128] =
+{
+	a1, b1, c1, d1, e1, f1, g1, h1,
+	a2, b2, c2, d2, e2, f2, g2, h2,
+	a3, b3, c3, d3, e3, f3, g3, h3,
+	a4, b4, c4, d4, e4, f4, g4, h4,
+	a5, b5, c5, d5, e5, f5, g5, h5,
+	a6, b6, c6, d6, e6, f6, g6, h6,
+	a7, b7, c7, d7, e7, f7, g7, h7,
+	a8, b8, c8, d8, e8, f8, g8, h8
+};
+
+// MVV LVA [attacker][victim]
+static int mvv_lva[12][12] = {
+ 	105, 205, 305, 405, 505, 605,  105, 205, 305, 405, 505, 605,
+	104, 204, 304, 404, 504, 604,  104, 204, 304, 404, 504, 604,
+	103, 203, 303, 403, 503, 603,  103, 203, 303, 403, 503, 603,
+	102, 202, 302, 402, 502, 602,  102, 202, 302, 402, 502, 602,
+	101, 201, 301, 401, 501, 601,  101, 201, 301, 401, 501, 601,
+	100, 200, 300, 400, 500, 600,  100, 200, 300, 400, 500, 600,
+
+	105, 205, 305, 405, 505, 605,  105, 205, 305, 405, 505, 605,
+	104, 204, 304, 404, 504, 604,  104, 204, 304, 404, 504, 604,
+	103, 203, 303, 403, 503, 603,  103, 203, 303, 403, 503, 603,
+	102, 202, 302, 402, 502, 602,  102, 202, 302, 402, 502, 602,
+	101, 201, 301, 401, 501, 601,  101, 201, 301, 401, 501, 601,
+	100, 200, 300, 400, 500, 600,  100, 200, 300, 400, 500, 600
 };
 
 const U64 not_A_file = 18374403900871474942ULL;
@@ -267,11 +435,211 @@ U64 bishop_masks[64];
 U64 board[12];
 U64 occupancy[3];
 
+U64 hash_key;
+U64 piece_keys[12][64];
+U64 enpassant_keys[64];
+U64 castle_keys[16];
+U64 side_key;
+
+int killer_moves[2][64];
+int history_moves[12][64];
+
 int side = -1;
-
 int enpassant = no_sqr;
-
 int castle;
+
+
+
+int ply;
+
+int pv_length[64];
+int pv_table[64][64];
+
+int score_pv, follow_pv;
+
+const int full_depth_moves = 4;
+const int reduction_limit = 2;
+
+// exit from engine flag
+int quit = 0;
+
+// UCI "movestogo" command moves counter
+int movestogo = 30;
+
+// UCI "movetime" command time counter
+int movetime = -1;
+
+// UCI "time" command holder (ms)
+int time = -1;
+
+// UCI "inc" command's time increment holder
+int inc = 0;
+
+// UCI "starttime" command time holder
+int starttime = 0;
+
+// UCI "stoptime" command time holder
+int stoptime = 0;
+
+// variable to flag time control availability
+int timeset = 0;
+
+// variable to flag when the time is up
+int stopped = 0;
+
+int get_time_ms()
+{
+	struct timeval time_value;
+	gettimeofday(&time_value, NULL);
+	return time_value.tv_sec * 1000 + time_value.tv_usec / 1000;
+}
+
+
+int input_waiting()
+{
+    #ifndef WIN32
+        fd_set readfds;
+        struct timeval tv;
+        FD_ZERO (&readfds);
+        FD_SET (fileno(stdin), &readfds);
+        tv.tv_sec=0; tv.tv_usec=0;
+        select(16, &readfds, 0, 0, &tv);
+
+        return (FD_ISSET(fileno(stdin), &readfds));
+    #else
+        static int init = 0, pipe;
+        static HANDLE inh;
+        DWORD dw;
+
+        if (!init)
+        {
+            init = 1;
+            inh = GetStdHandle(STD_INPUT_HANDLE);
+            pipe = !GetConsoleMode(inh, &dw);
+            if (!pipe)
+            {
+                SetConsoleMode(inh, dw & ~(ENABLE_MOUSE_INPUT|ENABLE_WINDOW_INPUT));
+                FlushConsoleInputBuffer(inh);
+            }
+        }
+        
+        if (pipe)
+        {
+           if (!PeekNamedPipe(inh, NULL, 0, NULL, &dw, NULL)) return 1;
+           return dw;
+        }
+        
+        else
+        {
+           GetNumberOfConsoleInputEvents(inh, &dw);
+           return dw <= 1 ? 0 : dw;
+        }
+
+    #endif
+}
+
+
+// read GUI/user input
+void read_input()
+{
+    // bytes to read holder
+    int bytes;
+    
+    // GUI/user input
+    char input[256] = "", *endc;
+
+    // "listen" to STDIN
+    if (input_waiting())
+    {
+        // tell engine to stop calculating
+        stopped = 1;
+        
+        // loop to read bytes from STDIN
+        do
+        {
+            // read bytes from STDIN
+            bytes=read(fileno(stdin), input, 256);
+        }
+        
+        // until bytes available
+        while (bytes < 0);
+        
+        // searches for the first occurrence of '\n'
+        endc = strchr(input,'\n');
+        
+        // if found new line set value at pointer to 0
+        if (endc) *endc=0;
+        
+        // if input is available
+        if (strlen(input) > 0)
+        {
+            // match UCI "quit" command
+            if (!strncmp(input, "quit", 4))
+            {
+                // tell engine to terminate exacution    
+                quit = 1;
+            }
+
+            // // match UCI "stop" command
+            else if (!strncmp(input, "stop", 4))    {
+                // tell engine to terminate exacution
+                quit = 1;
+            }
+        }   
+    }
+}
+
+// a bridge function to interact between search and GUI input
+static void communicate() {
+	// if time is up break here
+    if(timeset == 1 && get_time_ms() > stoptime) {
+		// tell engine to stop calculating
+		stopped = 1;
+	}
+	
+    // read GUI input
+	read_input();
+}
+
+unsigned int seed = 1804289383;
+
+unsigned int get_random_number()
+{
+	unsigned int num = seed;
+
+	num ^= num << 13;
+	num ^= num >> 17;
+	num ^= num << 5;
+
+	return num;
+}
+
+unsigned int get_random_U32_number()
+{
+    unsigned int number = seed;
+    
+    // XOR shift algorithm
+    number ^= number << 13;
+    number ^= number >> 17;
+    number ^= number << 5;
+    
+    seed = number;
+
+    return number;
+}
+
+U64 get_random_U64_number()
+{
+    U64 n1, n2, n3, n4;
+    
+    // init random numbers slicing 16 bits from MS1B side
+    n1 = (U64)(get_random_U32_number()) & 0xFFFF;
+    n2 = (U64)(get_random_U32_number()) & 0xFFFF;
+    n3 = (U64)(get_random_U32_number()) & 0xFFFF;
+    n4 = (U64)(get_random_U32_number()) & 0xFFFF;
+    
+    return n1 | (n2 << 16) | (n3 << 32) | (n4 << 48);
+}
 
 static inline int count_bits(U64 bitboard)
 {
@@ -512,6 +880,36 @@ void print_board()
 	printf("    Castling: %c%c%c%c\n\n", (castle & wk) ? 'K' : '-', (castle & wq) ? 'Q' : '-', (castle & bk) ? 'k' : '-', (castle & bk) ? 'q' : '-');
 }
 
+U64 generate_hash_key()
+{
+	U64 final_key = 0ULL;
+	
+	U64 bitboard;
+	
+	for (int piece = P; piece <= k; piece++)
+	{
+		bitboard = board[piece];
+		
+		while(bitboard)
+		{
+			int square = get_lsb(bitboard);
+			
+			final_key ^= piece_keys[piece][square];
+			
+			pop_bit(bitboard, square);
+		}
+	}
+	
+	if (enpassant != no_sqr)
+		final_key ^= enpassant_keys[enpassant];
+		
+	final_key ^= castle_keys[castle];
+	
+	if (side == black) final_key ^= side_key;
+	
+	return final_key;
+}
+
 void parse_fen(char* fen)
 {
 	memset(board, 0ULL, sizeof(board));
@@ -613,6 +1011,8 @@ void parse_fen(char* fen)
 
 	occupancy[both] |= occupancy[white];
 	occupancy[both] |= occupancy[black];
+	
+	hash_key = generate_hash_key();
 }
 
 U64 set_occupancy(int index, int bits_in_mask, U64 attack_mask)
@@ -732,39 +1132,60 @@ static inline int is_square_attacked(int square, int side)
 	return 0;
 }
 
-// encode move
-#define encode_move(source, target, piece, promoted, capture, double, enpassant, castling) \
-    (source) |          \
-    (target << 6) |     \
-    (piece << 12) |     \
-    (promoted << 16) |  \
-    (capture << 20) |   \
-    (double << 21) |    \
-    (enpassant << 22) | \
-    (castling << 23)    \
+void init_random_keys()
+{
+	seed = 1804289383;	
+	
+	for (int piece = P; piece <= k; piece++)
+		for (int square = 0; square < 64; square++)
+			piece_keys[piece][square] = get_random_U64_number();
+			
+	for (int square = 0; square < 64; square++)
+		enpassant_keys[square] = get_random_U64_number();
+	
+	for (int i = 0; i < 16; i++)
+		castle_keys[i] = get_random_U64_number();
+		
+	side_key = get_random_U64_number();
+}
 
-#define get_move_source(move) (move & 0x3f)
-#define get_move_target(move) ((move & 0xfc0) >> 6)
-#define get_move_piece(move) ((move & 0xf000) >> 12)
-#define get_move_promoted(move) ((move & 0xf0000) >> 16)
-#define get_move_capture(move) (move & 0x100000)
-#define get_move_double(move) (move & 0x200000)
-#define get_move_enpassant(move) (move & 0x400000)
-#define get_move_castling(move) (move & 0x800000)
+void clear_transpos_table()
+{
+	for (int i = 0; i < hash_size; i++)
+	{
+		transpos_table[i].hash_key = 0;
+		transpos_table[i].depth = 0;
+		transpos_table[i].flag = 0;
+		transpos_table[i].score = 0;
+	}
+}
 
-// preserve board state
-#define copy_board()                                                      \
-    U64 board_copy[12], occupancy_copy[3];								  \
-    int side_copy, enpassant_copy, castle_copy;                           \
-    memcpy(board_copy, board, 96);										  \
-    memcpy(occupancy_copy, occupancy, 24);                                \
-    side_copy = side, enpassant_copy = enpassant, castle_copy = castle;   \
+static inline int read_tt_entry(int depth, int alpha, int beta)
+{
+	tt* hash_entry = &transpos_table[hash_key % hash_size];
+	
+	if (hash_entry->hash_key == hash_key)
+	{
+		if (hash_entry->flag == hash_flag_exact)
+			return hash_entry->score;
+		if ((hash_entry->flag == hash_flag_alpha) && (hash_entry->score <= alpha))
+			return alpha;
+		if ((hash_entry->flag == hash_flag_beta) && (hash_entry->score >= beta))
+			return beta;
+	}
+	
+	return no_hash_entry;
+}
 
-// restore board state
-#define take_back()                                                       \
-    memcpy(board, board_copy, 96);										  \
-    memcpy(occupancy, occupancy_copy, 24);                                \
-    side = side_copy, enpassant = enpassant_copy, castle = castle_copy;   \
+static inline void write_tt_entry(int depth, int score, int hash_flag)
+{	
+	tt* hash_entry = &transpos_table[hash_key % hash_size];
+	
+	hash_entry->hash_key = hash_key;
+	hash_entry->score = score;
+	hash_entry->flag = hash_flag;
+	hash_entry->depth = depth;
+}
 
 void print_move(int move)
 {
@@ -797,6 +1218,9 @@ static inline int make_move(int move, int move_flag)
 		pop_bit(board[piece], from_square);
 		set_bit(board[piece], to_square);
 
+		hash_key ^= piece_keys[piece][from_square];
+		hash_key ^= piece_keys[piece][to_square];
+
 		if (capture)
 		{
 			int start_piece, end_piece;
@@ -813,12 +1237,14 @@ static inline int make_move(int move, int move_flag)
 			}
 
 			// loop over bitboards opposite to the current side
-			for (int p = start_piece; p <= end_piece; p++)
+			for (int bb_piece = start_piece; bb_piece <= end_piece; bb_piece++)
 			{
-				if (get_bit(board[p], to_square))
+				if (get_bit(board[bb_piece], to_square))
 				{
 					// removes captured piece
-					pop_bit(board[p], to_square);
+					pop_bit(board[bb_piece], to_square);
+					
+					hash_key = piece_keys[bb_piece][to_square];
 					break;
 				}
 			}
@@ -827,16 +1253,56 @@ static inline int make_move(int move, int move_flag)
 		if (promoted)
 		{
 			pop_bit(board[(side == white) ? P : p], to_square);
+			
+			if (side == white)
+			{
+				pop_bit(board[P], to_square);
+				hash_key ^= piece_keys[P][to_square];
+			}
+			else
+			{
+				pop_bit(board[p], to_square);
+				hash_key ^= piece_keys[p][to_square];
+			}
+			
 			set_bit(board[promoted], to_square);
+			hash_key ^= piece_keys[promoted][to_square];
 		}
 
 		if (enpass)
-			(side == white) ? pop_bit(board[p], to_square + 8) : pop_bit(board[P], to_square - 8);
-
+		{
+			if (side == white)
+			{
+				pop_bit(board[p], to_square + 8);
+				
+				hash_key ^= piece_keys[p][to_square + 8];
+			}
+			else
+			{
+				pop_bit(board[P], to_square - 8);
+				hash_key ^= piece_keys[P][to_square - 8];
+			}
+		}
+		if (enpassant != no_sqr)		
+			hash_key ^= enpassant_keys[enpassant];
+			
 		enpassant = no_sqr;
 
 		if (doublePush)
+		{
 			(side == white) ? (enpassant = to_square + 8) : (enpassant = to_square - 8);
+			
+			if (side == white)
+			{
+				enpassant = to_square + 8;
+				hash_key ^= enpassant_keys[to_square + 8];
+			}
+			else
+			{
+				enpassant = to_square - 8;
+				hash_key ^= enpassant_keys[to_square - 8];
+			}
+		}
 
 		if (castling)
 		{
@@ -845,25 +1311,41 @@ static inline int make_move(int move, int move_flag)
 			case g1:
 				pop_bit(board[R], h1);
 				set_bit(board[R], f1);
+				
+				hash_key ^= piece_keys[R][h1];
+				hash_key ^= piece_keys[R][f1];
 				break;
 			case c1:
 				pop_bit(board[R], a1);
 				set_bit(board[R], d1);
+				
+				hash_key ^= piece_keys[R][a1];
+				hash_key ^= piece_keys[R][d1];
 				break;
 			case g8:
 				pop_bit(board[r], h8);
 				set_bit(board[r], f8);
+				
+				hash_key ^= piece_keys[r][h8];
+				hash_key ^= piece_keys[r][f8];
 				break;
 			case c8:
 				pop_bit(board[r], a8);
 				set_bit(board[r], d8);
+				
+				hash_key ^= piece_keys[r][a8];
+				hash_key ^= piece_keys[r][d8];
 				break;
 			}
 		}
 		
+		hash_key ^= castle_keys[castle];
+		
 		// update castling rights
 		castle &= castling_rights[from_square];
 		castle &= castling_rights[to_square];
+		
+		hash_key ^= castle_keys[castle];
 		
 		// zero out occupancy
 		memset(occupancy, 0ULL, 24);
@@ -878,6 +1360,8 @@ static inline int make_move(int move, int move_flag)
 		occupancy[both] |= occupancy[black];
 		
 		side ^= 1;
+		
+		hash_key ^= side_key;
 		
 		if (is_square_attacked((side == white) ? get_lsb(board[k]) : get_lsb(board[K]), side))
 		{
@@ -1022,7 +1506,7 @@ static inline void generate_moves(move_list* moves)
 
 							// generate double pawn pushes
 							if ((from_square >= a7 && from_square <= h7) && !get_bit(occupancy[both], to_square + 8))
-								add_move(moves, encode_move(from_square, to_square + 8, piece, n, 0, 1, 0, 0));
+								add_move(moves, encode_move(from_square, to_square + 8, piece, 0, 0, 1, 0, 0));
 						}
 					}
 
@@ -1250,48 +1734,647 @@ static inline void perft(int depth)
 	}
 }
 
-unsigned int state = 1804289383;
-
-unsigned int get_random_number()
+static inline void enable_pv_scoring(move_list* moves)
 {
-	unsigned int num = state;
-
-	num ^= num << 13;
-	num ^= num >> 17;
-	num ^= num << 5;
-
-	return num;
+	follow_pv = 0;
+	
+	for (int i = 0; i < moves->count; i++)
+	{
+		// make sure we hit a pv move
+		if (pv_table[0][ply] == moves->moves[i])
+		{
+			score_pv = 1;
+			follow_pv = 1;
+		}
+	}
 }
 
-int get_time_ms()
+static inline int score_move(int move)
 {
-	struct timeval time_value;
-	gettimeofday(&time_value, NULL);
-	return time_value.tv_sec * 1000 + time_value.tv_usec / 1000;
+	if (score_pv)
+	{
+		if (pv_table[0][ply] == move)
+		{
+			score_pv = 0;
+			return 20000;
+		}
+	}
+
+	if(get_move_capture(move))
+	{
+		int target_piece = P;
+		int start_piece, end_piece;
+		
+		if (side == white)
+		{
+			start_piece = p;
+			end_piece = k;
+		}
+		else
+		{
+			start_piece = P;
+			end_piece = K;
+		}
+		
+		for (int bb_piece = start_piece; bb_piece <= end_piece; bb_piece++)
+		{
+			if(get_bit(board[bb_piece], get_move_target(move)))
+			{
+				target_piece = bb_piece;
+				break;
+			}
+		}
+		
+		return mvv_lva[get_move_piece(move)][target_piece] + 10000;
+	}
+	else
+	{
+		if (killer_moves[0][ply] == move)
+			return 9000;
+		else if (killer_moves[1][ply] == move)
+			return 8000;
+		else
+			return history_moves[get_move_piece(move)][get_move_target(move)];
+	}
+}
+
+static inline int sort_moves(move_list* moves)
+{
+	int move_scores[moves->count];
+	
+	for (int i = 0; i < moves->count; i++)
+		move_scores[i] = score_move(moves->moves[i]);
+		
+	for (int current = 0; current < moves->count; current++)
+	{
+		for (int next = current + 1; next < moves->count; next++)
+		{
+			if (move_scores[current] < move_scores[next])
+			{
+				int temp_score = move_scores[current];
+				move_scores[current] = move_scores[next];
+				move_scores[next] = temp_score;
+				
+				int temp_move = moves->moves[current];
+				moves->moves[current] = moves->moves[next];
+				moves->moves[next] = temp_move;
+			}
+		}
+	}
+}
+
+static inline int evaluate() 
+{
+	int score = 0;
+	
+	U64 bitboard;
+	
+	int piece, square;
+	
+	for (int bb_piece = P; bb_piece <= k; bb_piece++)
+	{
+		bitboard = board[bb_piece];
+		
+		while (bitboard)
+		{
+			piece = bb_piece;
+			square = get_lsb(bitboard);
+			
+			score += material_score[piece];
+			
+			switch (piece)
+			{
+			case P:
+				score += pawn_score[square];
+				break;
+			case N:
+				score += knight_score[square];
+				break;
+			case B:
+				score += bishop_score[square];
+				break;
+			case R:
+				score += rook_score[square];
+				break;
+			case K:
+				score += king_score[square];
+				break;
+				
+			case p:
+				score -= pawn_score[mirror_score[square]];
+				break;
+			case n:
+				score -= knight_score[mirror_score[square]];
+				break;
+			case b:
+				score -= bishop_score[mirror_score[square]];
+				break;
+			case r:
+				score -= rook_score[mirror_score[square]];
+				break;
+			case k:
+				score -= king_score[mirror_score[square]];
+				break;
+			}
+			
+			pop_bit(bitboard, square);
+		}
+	}
+	
+	return (side == white) ? score : -score;
+}
+
+static inline int quiesce(int alpha, int beta)
+{
+	if (!(nodes & 2047))
+		communicate();
+		
+	nodes++;
+
+	int eval = evaluate();
+	
+	if (eval >= beta)
+		return beta;
+	
+	if (eval > alpha)
+		alpha = eval;
+	
+	move_list moves[1];
+	
+	generate_moves(moves);
+	
+	sort_moves(moves);
+	
+	for (int i = 0; i < moves->count; i++)
+	{
+		copy_board();
+		
+		ply++;
+		
+		if (!make_move(moves->moves[i], only_captures))
+		{
+			ply--;
+			continue;
+		}
+
+		int score = -quiesce(-beta, -alpha);
+		
+		ply--;
+		
+		take_back();
+		
+		if (stopped) return 0;
+		
+		if (score >= beta)
+			return beta;
+		
+		if (score > alpha)
+			alpha = score;
+	}
+	
+	return alpha;
+}
+
+static inline int negamax(int depth, int alpha, int beta)
+{
+	int hash_flag = hash_flag_alpha;
+	
+	int score;	
+		
+	if ((score = read_tt_entry(depth, alpha, beta)) != no_hash_entry)
+		return score;
+	
+	if (!(nodes & 2047))
+		communicate();
+	
+	pv_length[ply] = ply;
+	
+	if (depth == 0)
+		return quiesce(alpha, beta);
+		
+	if (ply > 63)
+		return evaluate();	
+	
+	nodes++;
+	
+	int in_check = is_square_attacked((side == white) ? get_lsb(board[K]) : get_lsb(board[k]), side ^ 1);
+	
+	if (in_check)
+		depth++;
+
+	int legal_moves = 0;
+	
+	// null move pruning
+	if (depth >= 3 && in_check == 0 && ply)
+	{
+		copy_board();
+		
+		// give black another move for more beta cutoffs
+		side ^= 1;
+		
+		enpassant = no_sqr;
+		
+		// search moves with a reduced depth
+		score = -negamax(depth - 1 - 2, -beta, -beta + 1);
+		
+		take_back();
+		
+		if (stopped) 
+			return 0;
+		
+		if (score >= beta)
+			return beta;
+	}
+	
+	move_list moves[1];
+	
+	generate_moves(moves);
+	
+	if (follow_pv)
+		enable_pv_scoring(moves);
+	
+	sort_moves(moves);
+	
+	int moves_searched = 0;
+	
+	for (int i = 0; i < moves->count; i++)
+	{
+		copy_board();
+		
+		ply++;
+		
+		if (!make_move(moves->moves[i], all_moves))
+		{
+			ply--;
+			continue;
+		}
+		
+		legal_moves++;
+		
+		// PVS or principal variation search
+		if (moves_searched == 0)
+			score = -negamax(depth - 1, -beta, -alpha);
+		else
+		{
+			// LMR or late move reduction
+			if (moves_searched >= full_depth_moves && depth >= reduction_limit && in_check == 0 && !get_move_capture(moves->moves[i]) && !get_move_promoted(moves->moves[i]))
+				score = -negamax(depth - 2, -alpha - 1, -alpha);
+			else
+				score = alpha + 1;
+				
+		if (score > alpha)
+			{
+				score = -negamax(depth - 1, -alpha - 1, -alpha);
+					
+				if ((score > alpha) && (score < beta))
+					// if LMR fails research at full depth
+					score = -negamax(depth - 1, -beta, -alpha);
+			}
+		}
+		
+		ply--;
+		take_back();
+		
+		moves_searched++;
+		
+		if (score >= beta)
+		{
+			write_tt_entry(depth, beta, hash_flag_beta);
+		
+			if (!get_move_capture(moves->moves[i]))
+			{
+				killer_moves[1][ply] = killer_moves[0][ply];
+				killer_moves[0][ply] = moves->moves[i];
+			}
+		
+			return beta;
+		}
+		
+		if (score > alpha)
+		{	
+			hash_flag = hash_flag_exact;
+			
+			if(!get_move_capture(moves->moves[i]))
+				history_moves[get_move_piece(moves->moves[i])][get_move_target(moves->moves[i])] += depth;
+		
+			alpha = score;
+
+			pv_table[ply][ply] = moves->moves[i];
+			
+			for (int next_ply = ply + 1; next_ply < pv_length[ply + 1]; next_ply++)
+				pv_table[ply][next_ply] = pv_table[ply + 1][next_ply];
+				
+			pv_length[ply] = pv_length[ply + 1];
+		}
+	}
+	
+	if (legal_moves == 0)
+	{
+		if(in_check)
+			return -49000 + ply;
+		else
+			return 0;
+	}
+	
+	write_tt_entry(depth, alpha, hash_flag);
+	
+	return alpha;
+}
+
+void select_move(int depth)
+{
+	nodes = 0;
+	
+	follow_pv = 0;
+	score_pv = 0;
+	
+	memset(killer_moves, 0, sizeof(killer_moves));
+	memset(history_moves, 0, sizeof(history_moves));
+	memset(pv_table, 0, sizeof(pv_table));
+	memset(pv_length, 0, sizeof(pv_length));
+	
+	int alpha = -INF;
+	int beta = INF;
+	int score;
+	
+	for (int current_depth = 1; current_depth <= depth; current_depth++)
+	{
+		if (stopped)
+			break;
+	
+		follow_pv = 1;
+	
+		score = negamax(current_depth, alpha, beta);
+		
+		// we went outside the window 
+		if ((score <= alpha) && (score >= beta))
+		{
+			// research with normal alpha and beta
+			alpha = -INF;
+			beta = INF;
+			continue;
+		}
+		
+		// setup aspiration window for next iteration, narrowing the scope for each ply
+		alpha = score - 50;
+		beta = score + 50;
+	
+		printf("info score cp %d depth %d nodes %ld time %d pv ", score, current_depth, nodes, get_time_ms() - starttime);
+	
+		for (int i = 0; i < pv_length[0]; i++)
+		{
+			print_move(pv_table[0][i]);
+			printf(" ");
+		}
+	
+		printf("\n");
+	}
+	
+	printf("bestmove ");
+	print_move(pv_table[0][0]);
+	printf("\n");
+}
+
+int parse_move(char* move_string)
+{
+	move_list moves[1];
+	
+	generate_moves(moves);
+	
+	int from_square = (move_string[0] - 'a') + (8 - (move_string[1] - '0')) * 8;
+	int to_square = (move_string[2] - 'a') + (8 - (move_string[3] - '0')) * 8;
+	
+	for (int i = 0; i < moves->count; i++)
+	{
+		int move = moves->moves[i];
+		
+		if (from_square == get_move_source(move) && to_square == get_move_target(move))
+		{
+			int promoted_piece = get_move_promoted(move);
+			
+			if (promoted_piece)
+			{
+				if ((promoted_piece == Q || promoted_piece == q) && move_string[4] == q)
+					return move;
+				else if ((promoted_piece == R || promoted_piece == r) && move_string[4] == r)
+					return move;
+				else if ((promoted_piece == N || promoted_piece == n) && move_string[4] == n)
+					return move;
+				else if ((promoted_piece == B || promoted_piece == b) && move_string[4] == b)
+					return move;
+					
+				continue;
+			}
+			
+			return move;
+		}
+	}
+	
+	return 0;
+}
+
+void parse_position(char* command)
+{
+	command += 9;
+	
+	char* current_char = command;
+	
+	// found startpos
+	if (strncmp(command, "startpos", 8) == 0)
+		parse_fen(start_position);
+	else
+	{
+		current_char = strstr(command, "fen");
+	
+		if (current_char == NULL)
+			parse_fen(start_position);
+		else
+		{
+			current_char += 4;
+			parse_fen(current_char);
+		}
+	}
+	
+	current_char = strstr(command, "moves");
+	
+	if (current_char != NULL)
+	{
+		current_char += 6;
+		printf("%s\n", current_char);
+		
+		while (*current_char)
+		{
+			int move = parse_move(current_char);
+			
+			if (move == 0)
+				break;
+				
+			make_move(move, all_moves);
+			
+			while(*current_char && *current_char != ' ')
+				current_char++;
+				
+			current_char++;
+		}
+	}
+}
+
+// parse UCI command "go"
+void parse_go(char *command)
+{
+    // init parameters
+    int depth = -1;
+
+    // init argument
+    char *argument = NULL;
+
+    // infinite search
+    if ((argument = strstr(command,"infinite"))) {}
+
+    // match UCI "binc" command
+    if ((argument = strstr(command,"binc")) && side == black)
+        // parse black time increment
+        inc = atoi(argument + 5);
+
+    // match UCI "winc" command
+    if ((argument = strstr(command,"winc")) && side == white)
+        // parse white time increment
+        inc = atoi(argument + 5);
+
+    // match UCI "wtime" command
+    if ((argument = strstr(command,"wtime")) && side == white)
+        // parse white time limit
+        time = atoi(argument + 6);
+
+    // match UCI "btime" command
+    if ((argument = strstr(command,"btime")) && side == black)
+        // parse black time limit
+        time = atoi(argument + 6);
+
+    // match UCI "movestogo" command
+    if ((argument = strstr(command,"movestogo")))
+        // parse number of moves to go
+        movestogo = atoi(argument + 10);
+
+    // match UCI "movetime" command
+    if ((argument = strstr(command,"movetime")))
+        // parse amount of time allowed to spend to make a move
+        movetime = atoi(argument + 9);
+
+    // match UCI "depth" command
+    if ((argument = strstr(command,"depth")))
+        // parse search depth
+        depth = atoi(argument + 6);
+
+    // if move time is not available
+    if(movetime != -1)
+    {
+        // set time equal to move time
+        time = movetime;
+
+        // set moves to go to 1
+        movestogo = 1;
+    }
+
+    // init start time
+    starttime = get_time_ms();
+
+    // init search depth
+    depth = depth;
+
+    // if time control is available
+    if(time != -1)
+    {
+        // flag we're playing with time control
+        timeset = 1;
+
+        // set up timing
+        time /= movestogo;
+        time -= 50;
+        stoptime = starttime + time + inc;
+    }
+
+    // if depth is not available
+    if(depth == -1)
+        // set depth to 64 plies (takes ages to complete...)
+        depth = 64;
+
+    // print debug info
+    printf("time:%d start:%d stop:%d depth:%d timeset:%d\n",
+    time, starttime, stoptime, depth, timeset);
+
+    // search position
+    select_move(depth);
+}
+void uci_loop()
+{
+	setbuf(stdin, NULL);
+	setbuf(stdout, NULL);
+	
+	char input[2000];
+	
+	printf("id name LCCEngine\n");
+	printf("id name Lancer\n");
+	printf("uciok\n");
+	
+	while(1)
+	{
+		memset(input, 0, sizeof(input));
+		
+		fflush(stdout);
+		
+		if (!fgets(input, 2000, stdin))
+			continue;
+			
+		if (input[0] == '\n')
+			continue;
+			
+		if (strncmp(input, "isready", 7) == 0)
+		{
+			printf("readyok\n");
+			continue;
+		}
+		else if (strncmp(input, "position", 8) == 0)
+			parse_position(input);
+		else if (strncmp(input, "ucinewgame", 10) == 0)
+			parse_position("position startpos");	
+		else if (strncmp(input, "go", 2) == 0)
+			parse_go(input);
+		else if (strncmp(input, "quit", 4) == 0)
+			break;
+		else if (strncmp(input, "uci", 3) == 0)
+		{
+			printf("id name LCCEngine\n");
+			printf("id name Lancer\n");
+			printf("uciok\n");
+		}
+	}
 }
 
 void init_all()
 {
 	init_leaper_attacks();
+	
 	init_slider_attacks(bishop);
 	init_slider_attacks(rook);
+	
+	init_random_keys();
 }
 
 int main()
 {
 	init_all();
-
-	parse_fen(start_position);
-	print_board();
+	/*uci_loop();
+	
+	return 0;*/
 
 	int start = get_time_ms();
 	
-	perft(4);
+	parse_fen(tricky_position);
+	print_board();
+	select_move(7);
 	
 	int end = get_time_ms();
-	
-	printf("Run time: %d ms\n", end-start);
-	printf("Nodes: %ld\n", nodes);
 
 	return 0;
 }
