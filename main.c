@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <Windows.h>
+#include <windows.h>
 
 #define U64 unsigned long long
 
@@ -446,6 +446,11 @@ U64 enpassant_keys[64];
 U64 castle_keys[16];
 U64 side_key;
 
+// repetition table
+U64 repetition_table[1000];	
+
+int rep_index = 0;
+
 int killer_moves[2][64];
 int history_moves[12][64];
 
@@ -473,7 +478,7 @@ int movestogo = 30;
 int movetime = -1;
 
 // UCI "time" command holder (ms)
-int time = -1;
+int ttime = -1;
 
 // UCI "inc" command's time increment holder
 int inc = 0;
@@ -492,24 +497,12 @@ int stopped = 0;
 
 int get_time_ms()
 {
-	struct timeval time_value;
-	gettimeofday(&time_value, NULL);
-	return time_value.tv_sec * 1000 + time_value.tv_usec / 1000;
+	return GetTickCount();
 }
 
 
 int input_waiting()
 {
-#ifndef WIN32
-	fd_set readfds;
-	struct timeval tv;
-	FD_ZERO(&readfds);
-	FD_SET(fileno(stdin), &readfds);
-	tv.tv_sec = 0; tv.tv_usec = 0;
-	select(16, &readfds, 0, 0, &tv);
-
-	return (FD_ISSET(fileno(stdin), &readfds));
-#else
 	static int init = 0, pipe;
 	static HANDLE inh;
 	DWORD dw;
@@ -537,8 +530,6 @@ int input_waiting()
 		GetNumberOfConsoleInputEvents(inh, &dw);
 		return dw <= 1 ? 0 : dw;
 	}
-
-#endif
 }
 
 
@@ -922,6 +913,14 @@ void parse_fen(char* fen)
 	side = 0;
 	enpassant = no_sqr;
 	castle = 0;
+
+	hash_key = 0ULL;
+
+	rep_index = 0;
+
+	memset(repetition_table, 0, sizeof(repetition_table));
+
+	ply = 0;
 
 	for (int rank = 0; rank < 8; rank++)
 	{
@@ -1900,6 +1899,17 @@ static inline int evaluate()
 	return (side == white) ? score : -score;
 }
 
+static inline int is_repetition()
+{
+	for (int i = 0; i < rep_index; i++)
+	{
+		if (repetition_table[i] == hash_key)
+			return 1;
+	}
+	
+	return 0;
+}
+
 static inline int quiesce(int alpha, int beta)
 {
 	if ((nodes & 2047) == 0)
@@ -1924,18 +1934,23 @@ static inline int quiesce(int alpha, int beta)
 	for (int i = 0; i < moves->count; i++)
 	{
 		copy_board();
-
 		ply++;
+
+		rep_index++;
+		repetition_table[rep_index] = hash_key;
 
 		if (!make_move(moves->moves[i], only_captures))
 		{
 			ply--;
+			rep_index--;
 			continue;
 		}
 
 		int score = -quiesce(-beta, -alpha);
 
 		ply--;
+
+		rep_index--;
 
 		take_back();
 
@@ -1958,6 +1973,9 @@ static inline int negamax(int depth, int alpha, int beta)
 	int score;
 
 	int pv_node = beta - alpha > 1;
+
+	if (ply && is_repetition())
+		return 0;
 
 	if (ply && (score = read_tt_entry(depth, alpha, beta)) != no_hash_entry && !pv_node)
 		return score;
@@ -1988,6 +2006,9 @@ static inline int negamax(int depth, int alpha, int beta)
 		copy_board();
 		ply++;
 
+		rep_index++;
+		repetition_table[rep_index] = hash_key;
+
 		if (enpassant != no_sqr) hash_key ^= enpassant_keys[enpassant];
 
 		// give black another move for more beta cutoffs
@@ -2001,6 +2022,8 @@ static inline int negamax(int depth, int alpha, int beta)
 		score = -negamax(depth - 1 - 2, -beta, -beta + 1);
 
 		ply--;
+		rep_index--;
+
 		take_back();
 
 		if (stopped)
@@ -2026,9 +2049,13 @@ static inline int negamax(int depth, int alpha, int beta)
 		copy_board();
 		ply++;
 
+		rep_index++;
+		repetition_table[rep_index] = hash_key;
+
 		if (!make_move(moves->moves[i], all_moves))
 		{
 			ply--;
+			rep_index--;
 			continue;
 		}
 
@@ -2056,6 +2083,8 @@ static inline int negamax(int depth, int alpha, int beta)
 		}
 
 		ply--;
+		rep_index--;
+
 		take_back();
 
 		if (stopped)
@@ -2145,14 +2174,12 @@ void select_move(int depth)
 		alpha = score - 50;
 		beta = score + 50;
 
-		if (score > -49000 && score < -48000)
-			printf("info score mate %d depth %d nodes %ld time %d pv ", -(score + 48000), current_depth, nodes, get_time_ms() - starttime);
-		else if (score > 48000 && score < 49000)
-			printf("info score mate %d depth %d nodes %ld time %d pv ", (48000 - score), current_depth, nodes, get_time_ms() - starttime);
+		if (score > -mate_value && score < -mate_score)
+			printf("info score mate %d depth %d nodes %ld time %d pv ", -(score + mate_score), current_depth, nodes, get_time_ms() - starttime);
+		else if (score > mate_score && score < mate_value)
+			printf("info score mate %d depth %d nodes %ld time %d pv ", (mate_score - score), current_depth, nodes, get_time_ms() - starttime);
 		else
 			printf("info score cp %d depth %d nodes %ld time %d pv ", score, current_depth, nodes, get_time_ms() - starttime);
-
-
 
 		for (int i = 0; i < pv_length[0]; i++)
 		{
@@ -2242,6 +2269,10 @@ void parse_position(char* command)
 			if (move == 0)
 				break;
 
+			rep_index++;
+
+			repetition_table[rep_index] = hash_key;
+
 			make_move(move, all_moves);
 
 			while (*current_char && *current_char != ' ')
@@ -2277,12 +2308,12 @@ void parse_go(char* command)
 	// match UCI "wtime" command
 	if ((argument = strstr(command, "wtime")) && side == white)
 		// parse white time limit
-		time = atoi(argument + 6);
+		ttime = atoi(argument + 6);
 
 	// match UCI "btime" command
 	if ((argument = strstr(command, "btime")) && side == black)
 		// parse black time limit
-		time = atoi(argument + 6);
+		ttime = atoi(argument + 6);
 
 	// match UCI "movestogo" command
 	if ((argument = strstr(command, "movestogo")))
@@ -2303,7 +2334,7 @@ void parse_go(char* command)
 	if (movetime != -1)
 	{
 		// set time equal to move time
-		time = movetime;
+		ttime = movetime;
 
 		// set moves to go to 1
 		movestogo = 1;
@@ -2316,25 +2347,25 @@ void parse_go(char* command)
 	depth = depth;
 
 	// if time control is available
-	if (time != -1)
+	if (ttime != -1)
 	{
 		// flag we're playing with time control
 		timeset = 1;
 
 		// set up timing
-		time /= movestogo;
-		time -= 50;
-		stoptime = starttime + time + inc;
+		ttime /= movestogo;
+		ttime -= 50;
+		stoptime = starttime + ttime + inc;
 	}
 
 	// if depth is not available
 	if (depth == -1)
 		// set depth to 64 plies (takes ages to complete...)
-		depth = 9;
+		depth = max_ply;
 
 	// print debug info
 	printf("time:%d start:%d stop:%d depth:%d timeset:%d\n",
-		time, starttime, stoptime, depth, timeset);
+		ttime, starttime, stoptime, depth, timeset);
 
 	// search position
 	select_move(depth);
@@ -2398,6 +2429,8 @@ void init_all()
 	init_slider_attacks(rook);
 
 	init_random_keys();
+
+	clear_transpos_table();
 }
 
 int main()
@@ -2408,19 +2441,18 @@ int main()
 
 	//return 0;
 
-	int start = get_time_ms();
-
 	parse_fen(start_position);
-	print_board();
 
 	while (1)
 	{
-		select_move(11);
 		print_board();
-		getchar();
+
+		int start = get_time_ms();
+		select_move(11);
+		int end = get_time_ms();
+
+		make_move(pv_table[0][0], all_moves);
 	}
-		
-	int end = get_time_ms();
 
 	return 0;
 }
