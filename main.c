@@ -1941,7 +1941,7 @@ static inline int negamax(int depth, int alpha, int beta)
 	
 	int score;	
 		
-	if ((score = read_tt_entry(depth, alpha, beta)) != no_hash_entry)
+	if (ply && (score = read_tt_entry(depth, alpha, beta)) != no_hash_entry)
 		return score;
 	
 	if (!(nodes & 2047))
@@ -1968,15 +1968,21 @@ static inline int negamax(int depth, int alpha, int beta)
 	if (depth >= 3 && in_check == 0 && ply)
 	{
 		copy_board();
+		ply++;
+		
+		if (enpassant != no_sqr) hash_key ^= enpassant_keys[enpassant];
 		
 		// give black another move for more beta cutoffs
 		side ^= 1;
+		
+		hash_key ^= side_key;
 		
 		enpassant = no_sqr;
 		
 		// search moves with a reduced depth
 		score = -negamax(depth - 1 - 2, -beta, -beta + 1);
 		
+		ply--;
 		take_back();
 		
 		if (stopped) 
@@ -2000,7 +2006,6 @@ static inline int negamax(int depth, int alpha, int beta)
 	for (int i = 0; i < moves->count; i++)
 	{
 		copy_board();
-		
 		ply++;
 		
 		if (!make_move(moves->moves[i], all_moves))
@@ -2092,7 +2097,7 @@ void select_move(int depth)
 	memset(history_moves, 0, sizeof(history_moves));
 	memset(pv_table, 0, sizeof(pv_table));
 	memset(pv_length, 0, sizeof(pv_length));
-	
+
 	int alpha = -INF;
 	int beta = INF;
 	int score;
@@ -2337,7 +2342,10 @@ void uci_loop()
 		else if (strncmp(input, "position", 8) == 0)
 			parse_position(input);
 		else if (strncmp(input, "ucinewgame", 10) == 0)
-			parse_position("position startpos");	
+		{
+			parse_position("position startpos");
+			clear_transpos_table();
+		}	
 		else if (strncmp(input, "go", 2) == 0)
 			parse_go(input);
 		else if (strncmp(input, "quit", 4) == 0)
