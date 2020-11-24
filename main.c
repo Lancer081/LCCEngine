@@ -500,7 +500,6 @@ int get_time_ms()
 	return GetTickCount();
 }
 
-
 int input_waiting()
 {
 	static int init = 0, pipe;
@@ -1173,8 +1172,8 @@ static inline int read_tt_entry(int depth, int alpha, int beta)
 		{
 			int score = hash_entry->score;
 
-			if (score < -48000) score += ply;
-			if (score > 48000) score -= ply;
+			if (score < -mate_score) score += ply;
+			if (score > mate_score) score -= ply;
 
 			if (hash_entry->flag == hash_flag_exact)
 				return score;
@@ -1194,8 +1193,8 @@ static inline void write_tt_entry(int depth, int score, int hash_flag)
 {
 	tt* hash_entry = &transpos_table[hash_key % hash_size];
 
-	if (score < -48000) score -= ply;
-	if (score > 48000) score += ply;
+	if (score < -mate_score) score -= ply;
+	if (score > mate_score) score += ply;
 
 	hash_entry->hash_key = hash_key;
 	hash_entry->score = score;
@@ -1956,11 +1955,13 @@ static inline int quiesce(int alpha, int beta)
 
 		if (stopped) return 0;
 
-		if (score >= beta)
-			return beta;
-
 		if (score > alpha)
+		{
 			alpha = score;
+
+			if (score >= beta)
+				return beta;
+		}
 	}
 
 	return alpha;
@@ -2001,7 +2002,7 @@ static inline int negamax(int depth, int alpha, int beta)
 	int legal_moves = 0;
 
 	// null move pruning
-	if (depth >= 3 && in_check == 0 && ply)
+	if (depth >= 3 && !in_check && ply)
 	{
 		copy_board();
 		ply++;
@@ -2016,6 +2017,7 @@ static inline int negamax(int depth, int alpha, int beta)
 
 		hash_key ^= side_key;
 
+		if (enpassant != no_sqr) hash_key ^= enpassant_keys[enpassant];
 		enpassant = no_sqr;
 
 		// search moves with a reduced depth
@@ -2092,19 +2094,6 @@ static inline int negamax(int depth, int alpha, int beta)
 
 		moves_searched++;
 
-		if (score >= beta)
-		{
-			write_tt_entry(depth, beta, hash_flag_beta);
-
-			if (!get_move_capture(moves->moves[i]))
-			{
-				killer_moves[1][ply] = killer_moves[0][ply];
-				killer_moves[0][ply] = moves->moves[i];
-			}
-
-			return beta;
-		}
-
 		if (score > alpha)
 		{
 			hash_flag = hash_flag_exact;
@@ -2120,13 +2109,26 @@ static inline int negamax(int depth, int alpha, int beta)
 				pv_table[ply][next_ply] = pv_table[ply + 1][next_ply];
 
 			pv_length[ply] = pv_length[ply + 1];
+
+			if (score >= beta)
+			{
+				write_tt_entry(depth, beta, hash_flag_beta);
+
+				if (!get_move_capture(moves->moves[i]))
+				{
+					killer_moves[1][ply] = killer_moves[0][ply];
+					killer_moves[0][ply] = moves->moves[i];
+				}
+
+				return beta;
+			}
 		}
 	}
 
 	if (legal_moves == 0)
 	{
 		if (in_check)
-			return -49000 + ply;
+			return -mate_value + ply;
 		else
 			return 0;
 	}
@@ -2162,7 +2164,7 @@ void select_move(int depth)
 		score = negamax(current_depth, alpha, beta);
 
 		// we went outside the window 
-		if ((score <= alpha) && (score >= beta))
+		if ((score <= alpha) || (score >= beta))
 		{
 			// research with normal alpha and beta
 			alpha = -INF;
@@ -2270,7 +2272,6 @@ void parse_position(char* command)
 				break;
 
 			rep_index++;
-
 			repetition_table[rep_index] = hash_key;
 
 			make_move(move, all_moves);
@@ -2361,7 +2362,7 @@ void parse_go(char* command)
 	// if depth is not available
 	if (depth == -1)
 		// set depth to 64 plies (takes ages to complete...)
-		depth = max_ply;
+		depth = 10;
 
 	// print debug info
 	printf("time:%d start:%d stop:%d depth:%d timeset:%d\n",
@@ -2437,9 +2438,9 @@ int main()
 {
 	init_all();
 
-	//uci_loop();
+	uci_loop();
 
-	//return 0;
+	return 0;
 
 	parse_fen(start_position);
 
@@ -2448,10 +2449,11 @@ int main()
 		print_board();
 
 		int start = get_time_ms();
-		select_move(11);
+		select_move(10);
 		int end = get_time_ms();
 
 		make_move(pv_table[0][0], all_moves);
+		printf("Run time: %dms", end - start);
 	}
 
 	return 0;
